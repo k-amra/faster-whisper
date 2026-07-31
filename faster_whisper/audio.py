@@ -35,7 +35,9 @@ def decode_audio(
       separated left and right channels.
     """
     resampler = av.audio.resampler.AudioResampler(
-        format="s16",
+        # fltp: decode straight to float32 planar, skipping the s16
+        # intermediate and the extra astype/scale pass over the whole buffer.
+        format="fltp",
         layout="mono" if not split_stereo else "stereo",
         rate=sampling_rate,
     )
@@ -56,18 +58,26 @@ def decode_audio(
 
     # It appears that some objects related to the resampler are not freed
     # unless the garbage collector is manually run.
+    # https://github.com/SYSTRAN/faster-whisper/issues/390
+    # note that this slows down loading the audio a little bit
+    # if that is a concern, please use ffmpeg directly as in here:
+    # https://github.com/openai/whisper/blob/25639fc/whisper/audio.py#L25-L62
     del resampler
-    gc.collect()
+    # Collect only the youngest generation: it still breaks the short-lived
+    # reference cycles left by the PyAV resampler (issue #390) but avoids the
+    # full-heap pause that gc.collect() imposes on every decode.
+    gc.collect(0)
 
     audio = np.frombuffer(raw_buffer.getbuffer(), dtype=dtype)
 
-    # Convert s16 back to f32.
-    audio = audio.astype(np.float32) / 32768.0
+    if dtype != np.float32:
+        # Fallback for any future resampler format change.
+        audio = audio.astype(np.float32) / 32768.0
 
     if split_stereo:
-        left_channel = audio[0::2]
-        right_channel = audio[1::2]
-        return left_channel, right_channel
+        # fltp stereo is planar: all left samples first, then all right.
+        half = len(audio) // 2
+        return audio[:half], audio[half:]
 
     return audio
 
@@ -104,9 +114,9 @@ def _resample_frames(frames, resampler):
         yield from resampler.resample(frame)
 
 
-def pad_or_trim(array, length: int, *, axis: int = -1):
+def pad_or_trim(array, length: int = 3000, *, axis: int = -1):
     """
-    Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
+    Pad or trim the Mel features array to 3000, as expected by the encoder.
     """
     if array.shape[axis] > length:
         array = array.take(indices=range(length), axis=axis)

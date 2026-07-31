@@ -1,55 +1,61 @@
 import bisect
 import functools
 import os
-import warnings
 
-from collections.abc import Callable
-from typing import List, NamedTuple, Optional, Union
+from tqdm import tqdm
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
-import torch
-
-from pyannote.audio.core.io import AudioFile
-from pyannote.audio.pipelines import VoiceActivityDetection
-from pyannote.audio.pipelines.utils import PipelineModel
-from pyannote.core import Annotation, Segment, SlidingWindowFeature
 
 from faster_whisper.utils import get_assets_path
 
 
 # The code below is adapted from https://github.com/snakers4/silero-vad.
-class VadOptions(NamedTuple):
+@dataclass
+class VadOptions:
     """VAD options.
 
     Attributes:
       threshold: Speech threshold. Silero VAD outputs speech probabilities for each audio chunk,
         probabilities ABOVE this value are considered as SPEECH. It is better to tune this
         parameter for each dataset separately, but "lazy" 0.5 is pretty good for most datasets.
+      neg_threshold: Silence threshold for determining the end of speech. If a probability is lower
+        than neg_threshold, it is always considered silence. Values higher than neg_threshold
+        are only considered speech if the previous sample was classified as speech; otherwise,
+        they are treated as silence. This parameter helps refine the detection of speech
+         transitions, ensuring smoother segment boundaries.
       min_speech_duration_ms: Final speech chunks shorter min_speech_duration_ms are thrown out.
       max_speech_duration_s: Maximum duration of speech chunks in seconds. Chunks longer
         than max_speech_duration_s will be split at the timestamp of the last silence that
-        lasts more than 100ms (if any), to prevent aggressive cutting. Otherwise, they will be
-        split aggressively just before max_speech_duration_s.
+        lasts more than min_silence_at_max_speech (if any), to prevent aggressive cutting.
+        Otherwise, they will be split aggressively just before max_speech_duration_s.
       min_silence_duration_ms: In the end of each speech chunk wait for min_silence_duration_ms
         before separating it
-      window_size_samples: Audio chunks of window_size_samples size are fed to the silero VAD model.
-        WARNING! Silero VAD models were trained using 512, 1024, 1536 samples for 16000 sample rate.
-        Values other than these may affect model performance!!
       speech_pad_ms: Final speech chunks are padded by speech_pad_ms each side
+      min_silence_at_max_speech: Minimum silence duration in ms which is used to avoid abrupt cuts
+          when max_speech_duration_s is reached.
+      use_max_poss_sil_at_max_speech: Whether to use the maximum possible silence at
+          max_speech_duration_s or not. If not, the last silence is used.
     """
 
     threshold: float = 0.5
-    min_speech_duration_ms: int = 250
+    neg_threshold: float = None
+    min_speech_duration_ms: int = 0
     max_speech_duration_s: float = float("inf")
     min_silence_duration_ms: int = 2000
-    window_size_samples: int = 1024
     speech_pad_ms: int = 400
+    min_silence_at_max_speech: int = 98
+    use_max_poss_sil_at_max_speech: bool = True
 
 
 def get_speech_timestamps(
     audio: np.ndarray,
     vad_options: Optional[VadOptions] = None,
+    sampling_rate: int = 16000,
+    device_index: int = 0,
+    progress: bool = False,
     **kwargs,
 ) -> List[dict]:
     """This method is used for splitting long audios into speech chunks using silero VAD.
@@ -57,6 +63,9 @@ def get_speech_timestamps(
     Args:
       audio: One dimensional float array.
       vad_options: Options for VAD processing.
+      sampling_rate: Sampling rate of the audio.
+      device_index: CUDA device index for GPU-accelerated VAD (if available).
+      progress: Show a tqdm progress bar while the VAD runs (useful for long files).
       kwargs: VAD options passed as keyword arguments for backward compatibility.
 
     Returns:
@@ -66,19 +75,15 @@ def get_speech_timestamps(
         vad_options = VadOptions(**kwargs)
 
     threshold = vad_options.threshold
+    neg_threshold = vad_options.neg_threshold
     min_speech_duration_ms = vad_options.min_speech_duration_ms
     max_speech_duration_s = vad_options.max_speech_duration_s
     min_silence_duration_ms = vad_options.min_silence_duration_ms
-    window_size_samples = vad_options.window_size_samples
+    window_size_samples = 512
     speech_pad_ms = vad_options.speech_pad_ms
+    min_silence_at_max_speech = vad_options.min_silence_at_max_speech
+    use_max_poss_sil_at_max_speech = vad_options.use_max_poss_sil_at_max_speech
 
-    if window_size_samples not in [512, 1024, 1536]:
-        warnings.warn(
-            "Unusual window_size_samples! Supported window_size_samples:\n"
-            " - [512, 1024, 1536] for 16000 sampling_rate"
-        )
-
-    sampling_rate = 16000
     min_speech_samples = sampling_rate * min_speech_duration_ms / 1000
     speech_pad_samples = sampling_rate * speech_pad_ms / 1000
     max_speech_samples = (
@@ -87,25 +92,21 @@ def get_speech_timestamps(
         - 2 * speech_pad_samples
     )
     min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
-    min_silence_samples_at_max_speech = sampling_rate * 98 / 1000
+    min_silence_samples_at_max_speech = sampling_rate * min_silence_at_max_speech / 1000
 
     audio_length_samples = len(audio)
 
-    model = get_vad_model()
-    state = model.get_initial_state(batch_size=1)
+    model = get_vad_model(device_index)
 
-    speech_probs = []
-    for current_start_sample in range(0, audio_length_samples, window_size_samples):
-        chunk = audio[current_start_sample : current_start_sample + window_size_samples]
-        if len(chunk) < window_size_samples:
-            chunk = np.pad(chunk, (0, int(window_size_samples - len(chunk))))
-        speech_prob, state = model(chunk, state, sampling_rate)
-        speech_probs.append(speech_prob)
+    speech_probs = model(audio, progress=progress)
 
     triggered = False
     speeches = []
     current_speech = {}
-    neg_threshold = threshold - 0.15
+    possible_ends = []
+
+    if neg_threshold is None:
+        neg_threshold = max(threshold - 0.15, 0.01)
 
     # to save potential segment end (and tolerate some silence)
     temp_end = 0
@@ -113,45 +114,67 @@ def get_speech_timestamps(
     prev_end = next_start = 0
 
     for i, speech_prob in enumerate(speech_probs):
+        cur_sample = window_size_samples * i
+
         if (speech_prob >= threshold) and temp_end:
+            sil_dur = cur_sample - temp_end
+            if sil_dur > min_silence_samples_at_max_speech:
+                possible_ends.append((temp_end, sil_dur))
             temp_end = 0
             if next_start < prev_end:
-                next_start = window_size_samples * i
+                next_start = cur_sample
 
         if (speech_prob >= threshold) and not triggered:
             triggered = True
-            current_speech["start"] = window_size_samples * i
+            current_speech["start"] = cur_sample
             continue
 
-        if (
-            triggered
-            and (window_size_samples * i) - current_speech["start"] > max_speech_samples
-        ):
-            if prev_end:
+        if triggered and (cur_sample - current_speech["start"] > max_speech_samples):
+            if use_max_poss_sil_at_max_speech and possible_ends:
+                prev_end, dur = max(possible_ends, key=lambda x: x[1])
                 current_speech["end"] = prev_end
                 speeches.append(current_speech)
                 current_speech = {}
-                # previously reached silence (< neg_thres) and is still not speech (< thres)
-                if next_start < prev_end:
-                    triggered = False
-                else:
+                next_start = prev_end + dur
+
+                if next_start < prev_end + cur_sample:
                     current_speech["start"] = next_start
+                else:
+                    triggered = False
                 prev_end = next_start = temp_end = 0
+                possible_ends = []
             else:
-                current_speech["end"] = window_size_samples * i
-                speeches.append(current_speech)
-                current_speech = {}
-                prev_end = next_start = temp_end = 0
-                triggered = False
-                continue
+                if prev_end:
+                    current_speech["end"] = prev_end
+                    speeches.append(current_speech)
+                    current_speech = {}
+                    if next_start < prev_end:
+                        triggered = False
+                    else:
+                        current_speech["start"] = next_start
+                    prev_end = next_start = temp_end = 0
+                    possible_ends = []
+                else:
+                    current_speech["end"] = cur_sample
+                    speeches.append(current_speech)
+                    current_speech = {}
+                    prev_end = next_start = temp_end = 0
+                    triggered = False
+                    possible_ends = []
+                    continue
 
         if (speech_prob < neg_threshold) and triggered:
             if not temp_end:
-                temp_end = window_size_samples * i
-            # condition to avoid cutting in very short silence
-            if (window_size_samples * i) - temp_end > min_silence_samples_at_max_speech:
+                temp_end = cur_sample
+            sil_dur_now = cur_sample - temp_end
+
+            if (
+                not use_max_poss_sil_at_max_speech
+                and sil_dur_now > min_silence_samples_at_max_speech
+            ):
                 prev_end = temp_end
-            if (window_size_samples * i) - temp_end < min_silence_samples:
+
+            if sil_dur_now < min_silence_samples:
                 continue
             else:
                 current_speech["end"] = temp_end
@@ -162,6 +185,7 @@ def get_speech_timestamps(
                 current_speech = {}
                 prev_end = next_start = temp_end = 0
                 triggered = False
+                possible_ends = []
                 continue
 
     if (
@@ -196,12 +220,72 @@ def get_speech_timestamps(
     return speeches
 
 
-def collect_chunks(audio: np.ndarray, chunks: List[dict]) -> np.ndarray:
-    """Collects and concatenates audio chunks."""
+def collect_chunks(
+    audio: np.ndarray,
+    chunks: List[dict],
+    sampling_rate: int = 16000,
+    max_duration: float = float("inf"),
+) -> Tuple[List[np.ndarray], List[Dict[str, float]]]:
+    """This function merges the chunks of audio into chunks of max_duration (s) length."""
     if not chunks:
-        return np.array([], dtype=np.float32)
+        chunk_metadata = {
+            "offset": 0,
+            "duration": 0,
+            "segments": [],
+        }
+        return [np.array([], dtype=np.float32)], [chunk_metadata]
 
-    return np.concatenate([audio[chunk["start"] : chunk["end"]] for chunk in chunks])
+    audio_chunks = []
+    chunks_metadata = []
+
+    current_segments = []
+    current_duration = 0
+    total_duration = 0
+    # Collect slices into a list; concatenate once per output chunk instead of
+    # once per input chunk.  The naive approach copies O(n²) samples in total
+    # because every np.concatenate allocates a fresh array and copies all prior
+    # data.  Deferring to a single np.concatenate reduces that to O(n).
+    current_slices: List[np.ndarray] = []
+
+    for chunk in chunks:
+        if (
+            current_duration + chunk["end"] - chunk["start"]
+            > max_duration * sampling_rate
+        ):
+            audio_chunks.append(
+                np.concatenate(current_slices)
+                if current_slices
+                else np.array([], dtype=np.float32)
+            )
+            chunk_metadata = {
+                "offset": total_duration / sampling_rate,
+                "duration": current_duration / sampling_rate,
+                "segments": current_segments,
+            }
+            total_duration += current_duration
+            chunks_metadata.append(chunk_metadata)
+
+            current_segments = [chunk]
+            current_slices = [audio[chunk["start"] : chunk["end"]]]
+            current_duration = chunk["end"] - chunk["start"]
+        else:
+            current_segments.append(chunk)
+            current_slices.append(audio[chunk["start"] : chunk["end"]])
+            current_duration += chunk["end"] - chunk["start"]
+
+    audio_chunks.append(
+        np.concatenate(current_slices)
+        if current_slices
+        else np.array([], dtype=np.float32)
+    )
+
+    chunk_metadata = {
+        "offset": total_duration / sampling_rate,
+        "duration": current_duration / sampling_rate,
+        "segments": current_segments,
+    }
+    chunks_metadata.append(chunk_metadata)
+    return audio_chunks, chunks_metadata
 
 
 class SpeechTimestampsMap:
@@ -227,15 +311,26 @@ class SpeechTimestampsMap:
         self,
         time: float,
         chunk_index: Optional[int] = None,
+        is_end: bool = False,
     ) -> float:
         if chunk_index is None:
-            chunk_index = self.get_chunk_index(time)
+            chunk_index = self.get_chunk_index(time, is_end)
 
         total_silence_before = self.total_silence_before[chunk_index]
         return round(total_silence_before + time, self.time_precision)
 
-    def get_chunk_index(self, time: float) -> int:
+    def get_chunk_index(self, time: float, is_end: bool = False) -> int:
         sample = int(time * self.sampling_rate)
+
+        if is_end:
+            # bisect_left finds the leftmost position where sample could be
+            # inserted to keep the list sorted.  If chunk_end_sample[idx] ==
+            # sample the sample lands exactly on a chunk boundary, which is the
+            # condition the original code tested with a linear `.index()` call.
+            idx = bisect.bisect_left(self.chunk_end_sample, sample)
+            if idx < len(self.chunk_end_sample) and self.chunk_end_sample[idx] == sample:
+                return idx
+
         return min(
             bisect.bisect(self.chunk_end_sample, sample),
             len(self.chunk_end_sample) - 1,
@@ -243,14 +338,14 @@ class SpeechTimestampsMap:
 
 
 @functools.lru_cache
-def get_vad_model():
-    """Returns the VAD model instance."""
-    path = os.path.join(get_assets_path(), "silero_vad.onnx")
-    return SileroVADModel(path)
+def get_vad_model(device_index: int = 0):
+    """Returns the VAD model instance, preferring CUDA when available."""
+    path = os.path.join(get_assets_path(), "silero_vad_v6.onnx")
+    return SileroVADModel(path, device_index=device_index)
 
 
 class SileroVADModel:
-    def __init__(self, path):
+    def __init__(self, path, device_index: int = 0):
         try:
             import onnxruntime
         except ImportError as e:
@@ -260,332 +355,133 @@ class SileroVADModel:
 
         opts = onnxruntime.SessionOptions()
         opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
+        # The VAD runs as one large batched inference, not many small
+        # sequential calls, so a few intra-op threads and the memory arena
+        # are a clear win instead of contention.
+        opts.intra_op_num_threads = min(4, os.cpu_count() or 1)
+        opts.enable_cpu_mem_arena = True
         opts.log_severity_level = 4
+        opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+        cuda_provider = (
+            "CUDAExecutionProvider",
+            {"device_id": device_index},
+        )
+        providers = (
+            [cuda_provider, "CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+            else ["CPUExecutionProvider"]
+        )
         self.session = onnxruntime.InferenceSession(
             path,
-            providers=["CPUExecutionProvider"],
+            providers=providers,
             sess_options=opts,
         )
 
-    def get_initial_state(self, batch_size: int):
-        h = np.zeros((2, batch_size, 64), dtype=np.float32)
-        c = np.zeros((2, batch_size, 64), dtype=np.float32)
-        return h, c
+    # Windows per inference block. Each block is block_windows x 576 float32
+    # (~4.6 MB at 2000), so peak memory stays flat no matter how long the audio
+    # is. Previously the whole file was materialized as one (num_windows, 576)
+    # buffer plus the matching ONNX input/output tensors — ~700 MB for a 2.7 h
+    # file and multiple GB for longer ones, which could exhaust RAM.
+    # Blocking is numerically safe: every window is inferred independently
+    # (each carries its own 64-sample context and a zero initial state), so
+    # splitting the batch does not change any window's output.
+    block_windows = 2000
 
-    def __call__(self, x, state, sr: int):
-        if len(x.shape) == 1:
-            x = np.expand_dims(x, 0)
-        if len(x.shape) > 2:
-            raise ValueError(
-                f"Too many dimensions for input audio chunk {len(x.shape)}"
-            )
-        if sr / x.shape[1] > 31.25:
-            raise ValueError("Input audio chunk is too short")
-
-        h, c = state
-
-        ort_inputs = {
-            "input": x,
-            "h": h,
-            "c": c,
-            "sr": np.array(sr, dtype="int64"),
-        }
-
-        out, h, c = self.session.run(None, ort_inputs)
-        state = (h, c)
-
-        return out, state
-
-
-# The code below is copied from whisper-x (https://github.com/m-bain/whisperX)
-# and adapted for faster_whisper.
-class SegmentX:
-    def __init__(self, start, end, speaker=None):
-        self.start = start
-        self.end = end
-        self.speaker = speaker
-
-
-class VoiceActivitySegmentation(VoiceActivityDetection):
-    """Pipeline wrapper class for Voice Activity Segmentation based on VAD scores."""
-
-    def __init__(
+    def __call__(
         self,
-        segmentation: PipelineModel = "pyannote/segmentation",
-        device: Optional[Union[str, torch.device]] = None,
-        fscore: bool = False,
-        use_auth_token: Optional[str] = None,
-        **inference_kwargs,
+        audio: np.ndarray,
+        num_samples: int = 512,
+        context_size_samples: int = 64,
+        progress: bool = False,
     ):
-        """Initialize the pipeline with the model name and the optional device.
+        assert audio.ndim == 1, "Input should be a 1D array"
 
-        Args:
-            dict parameters of VoiceActivityDetection class from pyannote:
-            segmentation (PipelineModel): Loaded model name.
-            device (torch.device or None): Device to perform the segmentation.
-            fscore (bool): Flag indicating whether to compute F-score during inference.
-            use_auth_token (str or None): Optional authentication token for model access.
-            inference_kwargs (dict):  Additional arguments from VoiceActivityDetection pipeline.
-        """
-        super().__init__(
-            segmentation=segmentation,
-            device=device,
-            fscore=fscore,
-            use_auth_token=use_auth_token,
-            **inference_kwargs,
+        n = len(audio)
+        # Preserve original padding semantics: always add (num_samples - n % num_samples)
+        # zeros at the end, which appends a full extra window when audio is already aligned.
+        pad_n = num_samples - n % num_samples
+        num_segments = (n + pad_n) // num_samples
+        full_segs = n // num_samples  # segments fully covered by audio (no padding needed)
+        remainder = n % num_samples
+
+        outputs = []
+        # Silero operates at 16 kHz: num_samples samples per window.
+        pbar = tqdm(
+            total=round(num_segments * num_samples / 16000.0, 1),
+            desc="VAD",
+            unit="s",
+            disable=not progress,
+            mininterval=0.5,
         )
+        try:
+            for s in range(0, num_segments, self.block_windows):
+                e = min(s + self.block_windows, num_segments)
+                block = np.empty(
+                    (e - s, context_size_samples + num_samples), dtype=np.float32
+                )
+                self._fill_block(
+                    block, s, audio, full_segs, remainder,
+                    num_samples, context_size_samples,
+                )
+                h = np.zeros((1, 1, 128), dtype="float32")
+                c = np.zeros((1, 1, 128), dtype="float32")
+                out, _, _ = self.session.run(
+                    None,
+                    {"input": block, "h": h, "c": c},
+                )
+                outputs.append(out)
+                pbar.update(round((e - s) * num_samples / 16000.0, 1))
+        finally:
+            pbar.close()
 
-    def apply(self, file: AudioFile, hook: Optional[Callable] = None) -> Annotation:
-        """Apply voice activity detection on the audio file.
+        return np.concatenate(outputs, axis=0)
 
-        Args:
-            file (AudioFile): Processed file.
-            hook (callable): Hook called with signature: hook("step_name", step_artefact, file=file)
-
-        Returns:
-            segmentations (Annotation): Voice activity segmentation.
-        """
-        # setup hook (e.g. for debugging purposes)
-        hook = self.setup_hook(file, hook=hook)
-
-        # apply segmentation model if needed
-        # output shape is (num_chunks, num_frames, 1)
-        if self.training:
-            if self.CACHED_SEGMENTATION in file:
-                segmentations = file[self.CACHED_SEGMENTATION]
-            else:
-                segmentations = self._segmentation(file)
-                file[self.CACHED_SEGMENTATION] = segmentations
-        else:
-            segmentations: SlidingWindowFeature = self._segmentation(file)
-
-        return segmentations
-
-
-class BinarizeVadScores:
-    """Binarize detection scores using hysteresis thresholding.
-
-    Reference:
-        Gregory Gelly and Jean-Luc Gauvain. "Minimum Word Error Training of
-        RNN-based Voice Activity Detection", InterSpeech 2015.
-
-        Modified by Max Bain to include WhisperX's min-cut operation
-        https://arxiv.org/abs/2303.00747
-
-    """
-
-    def __init__(
-        self,
-        onset: float = 0.5,
-        offset: Optional[float] = None,
-        min_duration_on: float = 0.0,
-        min_duration_off: float = 0.0,
-        pad_onset: float = 0.0,
-        pad_offset: float = 0.0,
-        max_duration: float = float("inf"),
+    @staticmethod
+    def _fill_block(
+        block, start, audio, full_segs, remainder, num_samples, context
     ):
-        """Initializes the parameters for Binarizing the VAD scores.
+        """Fill block rows for global window indices [start, start+len(block))
+        with [context | window] samples, exactly matching the layout the old
+        single-buffer implementation produced."""
+        rows = block.shape[0]
+        end = start + rows
 
-        Args:
-            onset (float, optional):
-                Onset threshold. Defaults to 0.5.
-            offset (float, optional):
-                Offset threshold. Defaults to `onset`.
-            min_duration_on (float, optional):
-                Remove active regions shorter than that many seconds. Defaults to 0s.
-            min_duration_off (float, optional):
-                Fill inactive regions shorter than that many seconds. Defaults to 0s.
-            pad_onset (float, optional):
-                Extend active regions by moving their start time by that many seconds.
-                Defaults to 0s.
-            pad_offset (float, optional):
-                Extend active regions by moving their end time by that many seconds.
-                Defaults to 0s.
-            max_duration (float):
-                The maximum length of an active segment.
-        """
-        super().__init__()
+        # Audio region of fully-covered windows.
+        full_end = min(end, full_segs)
+        if start < full_end:
+            r = full_end - start
+            block[:r, context:] = audio[
+                start * num_samples : full_end * num_samples
+            ].reshape(r, num_samples)
 
-        self.onset = onset
-        self.offset = offset or onset
+        # Trailing window (partial tail, or all zeros when audio is aligned).
+        if end > full_segs:
+            row = full_segs - start
+            if 0 <= row < rows:
+                block[row, context:] = 0.0
+                if remainder:
+                    block[row, context : context + remainder] = audio[
+                        full_segs * num_samples :
+                    ]
 
-        self.pad_onset = pad_onset
-        self.pad_offset = pad_offset
-
-        self.min_duration_on = min_duration_on
-        self.min_duration_off = min_duration_off
-
-        self.max_duration = max_duration
-
-    def __get_active_regions(self, scores: SlidingWindowFeature) -> Annotation:
-        """Extract active regions from VAD scores.
-
-        Args:
-            scores (SlidingWindowFeature): Detection scores.
-
-        Returns:
-            active (Annotation): Active regions.
-        """
-        num_frames, num_classes = scores.data.shape
-        frames = scores.sliding_window
-        timestamps = [frames[i].middle for i in range(num_frames)]
-        # annotation meant to store 'active' regions
-        active = Annotation()
-        for k, k_scores in enumerate(scores.data.T):
-            label = k if scores.labels is None else scores.labels[k]
-
-            # initial state
-            start = timestamps[0]
-            is_active = k_scores[0] > self.onset
-            curr_scores = [k_scores[0]]
-            curr_timestamps = [start]
-            t = start
-            # optionally add `strict=False` for python 3.10 or later
-            for t, y in zip(timestamps[1:], k_scores[1:]):
-                # currently active
-                if is_active:
-                    curr_duration = t - start
-                    if curr_duration > self.max_duration:
-                        search_after = len(curr_scores) // 2
-                        # divide segment
-                        min_score_div_idx = search_after + np.argmin(
-                            curr_scores[search_after:]
-                        )
-                        min_score_t = curr_timestamps[min_score_div_idx]
-                        region = Segment(
-                            start - self.pad_onset, min_score_t + self.pad_offset
-                        )
-                        active[region, k] = label
-                        start = curr_timestamps[min_score_div_idx]
-                        curr_scores = curr_scores[min_score_div_idx + 1 :]
-                        curr_timestamps = curr_timestamps[min_score_div_idx + 1 :]
-                    # switching from active to inactive
-                    elif y < self.offset:
-                        region = Segment(start - self.pad_onset, t + self.pad_offset)
-                        active[region, k] = label
-                        start = t
-                        is_active = False
-                        curr_scores = []
-                        curr_timestamps = []
-                    curr_scores.append(y)
-                    curr_timestamps.append(t)
-                # currently inactive
-                else:
-                    # switching from inactive to active
-                    if y > self.onset:
-                        start = t
-                        is_active = True
-
-            # if active at the end, add final region
-            if is_active:
-                region = Segment(start - self.pad_onset, t + self.pad_offset)
-                active[region, k] = label
-
-        return active
-
-    def __call__(self, scores: SlidingWindowFeature) -> Annotation:
-        """Binarize detection scores.
-
-        Args:
-            scores (SlidingWindowFeature): Detection scores.
-
-        Returns:
-            active (Annotation): Binarized scores.
-        """
-        active = self.__get_active_regions(scores)
-        # because of padding, some active regions might be overlapping: merge them.
-        # also: fill same speaker gaps shorter than min_duration_off
-        if self.pad_offset > 0.0 or self.pad_onset > 0.0 or self.min_duration_off > 0.0:
-            if self.max_duration < float("inf"):
-                raise NotImplementedError("This would break current max_duration param")
-            active = active.support(collar=self.min_duration_off)
-
-        # remove tracks shorter than min_duration_on
-        if self.min_duration_on > 0:
-            for segment, track in list(active.itertracks()):
-                if segment.duration < self.min_duration_on:
-                    del active[segment, track]
-
-        return active
-
-
-def merge_vad(
-    vad_arr, pad_onset=0.0, pad_offset=0.0, min_duration_off=0.0, min_duration_on=0.0
-):
-    active = Annotation()
-    for k, vad_t in enumerate(vad_arr):
-        region = Segment(vad_t[0] - pad_onset, vad_t[1] + pad_offset)
-        active[region, k] = 1
-
-    if pad_offset > 0.0 or pad_onset > 0.0 or min_duration_off > 0.0:
-        active = active.support(collar=min_duration_off)
-
-    # remove tracks shorter than min_duration_on
-    if min_duration_on > 0:
-        for segment, track in list(active.itertracks()):
-            if segment.duration < min_duration_on:
-                del active[segment, track]
-
-    active = active.for_json()
-    active_segs = pd.DataFrame([x["segment"] for x in active["content"]])
-    return active_segs
-
-
-def merge_chunks(
-    segments,
-    chunk_size,
-    onset: float = 0.5,
-    offset: Optional[float] = None,
-):
-    """
-    Merge operation described in paper
-    """
-    curr_end = 0
-    merged_segments = []
-    seg_idxs = []
-    speaker_idxs = []
-
-    assert chunk_size > 0
-    binarize = BinarizeVadScores(max_duration=chunk_size, onset=onset, offset=offset)
-    segments = binarize(segments)
-    segments_list = []
-    for speech_turn in segments.get_timeline():
-        segments_list.append(
-            SegmentX(
-                max(0.0, speech_turn.start - 0.1), speech_turn.end + 0.1, "UNKNOWN"
-            )
-        )  # 100ms padding to account for edge errors
-
-    if len(segments_list) == 0:
-        print("No active speech found in audio")
-        return []
-    # assert segments_list, "segments_list is empty."
-    # Make sur the starting point is the start of the segment.
-    curr_start = segments_list[0].start
-
-    for seg in segments_list:
-        if seg.end - curr_start > chunk_size and curr_end - curr_start > 0:
-            merged_segments.append(
-                {
-                    "start": curr_start,
-                    "end": curr_end,
-                    "segments": seg_idxs,
-                }
-            )
-            curr_start = seg.start
-            seg_idxs = []
-            speaker_idxs = []
-        curr_end = seg.end
-        seg_idxs.append((seg.start, seg.end))
-        speaker_idxs.append(seg.speaker)
-    # add final
-    merged_segments.append(
-        {
-            "start": curr_start,
-            "end": curr_end,
-            "segments": seg_idxs,
-        }
-    )
-    return merged_segments
+        # Context region: window i gets the last `context` samples of window i-1.
+        if start == 0:
+            block[0, :context] = 0.0
+        i0 = max(start, 1)
+        ctx_full_end = min(end, full_segs)
+        if i0 < ctx_full_end:
+            cnt = ctx_full_end - i0
+            src = audio[
+                i0 * num_samples - context : i0 * num_samples - context + cnt * num_samples
+            ]
+            block[i0 - start : ctx_full_end - start, :context] = src.reshape(
+                cnt, num_samples
+            )[:, :context]
+        # Context of the trailing window: the last `context` samples of the audio.
+        if end > full_segs and full_segs > 0:
+            row = full_segs - start
+            if 0 <= row < rows:
+                block[row, :context] = audio[
+                    full_segs * num_samples - context : full_segs * num_samples
+                ]
