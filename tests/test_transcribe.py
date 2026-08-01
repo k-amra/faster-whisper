@@ -47,9 +47,7 @@ def test_batched_transcribe(physcisworks_path):
     for segment, info in result:
         assert info.language == "en"
         assert info.language_probability > 0.7
-        segments.append(
-            {"start": segment.start, "end": segment.end, "text": segment.text}
-        )
+        segments.append({"start": segment.start, "end": segment.end, "text": segment.text})
     assert len(segments) == 8  # number of near 30 sec segments
 
     segment = segments[0]

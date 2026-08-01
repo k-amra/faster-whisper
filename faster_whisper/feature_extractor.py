@@ -15,9 +15,9 @@ try:
         return _scipy_fft.rfft(a, n=n, axis=axis, norm=norm, workers=_FFT_WORKERS)
 
 except ImportError:  # pragma: no cover - scipy is optional
+
     def _rfft(a, n, axis, norm):
         return np.fft.rfft(a, n=n, axis=axis, norm=norm)
-
 
 
 class FeatureExtractor:
@@ -36,9 +36,9 @@ class FeatureExtractor:
         self.nb_max_frames = self.n_samples // hop_length
         self.time_per_frame = hop_length / sampling_rate
         self.sampling_rate = sampling_rate
-        self.mel_filters = self.get_mel_filters(
-            sampling_rate, n_fft, n_mels=feature_size
-        ).astype("float32")
+        self.mel_filters = self.get_mel_filters(sampling_rate, n_fft, n_mels=feature_size).astype(
+            "float32"
+        )
         # Cache the Hann window once; recomputing it per chunk is pure waste.
         self.window = np.hanning(n_fft + 1)[:-1].astype("float32")
 
@@ -111,9 +111,7 @@ class FeatureExtractor:
         )
 
         if not return_complex and return_complex is None:
-            raise ValueError(
-                "stft requires the return_complex parameter for real inputs."
-            )
+            raise ValueError("stft requires the return_complex parameter for real inputs.")
 
         # Input checks
         if not np.issubdtype(input_array.dtype, np.floating) and not input_is_complex:
@@ -123,9 +121,7 @@ class FeatureExtractor:
             )
 
         if input_array.ndim > 2 or input_array.ndim < 1:
-            raise ValueError(
-                f"stft: expected a 1D or 2D array, but got {input_array.ndim}D array"
-            )
+            raise ValueError(f"stft: expected a 1D or 2D array, but got {input_array.ndim}D array")
 
         # Handle 1D input
         if input_array.ndim == 1:
@@ -137,22 +133,16 @@ class FeatureExtractor:
         # Center padding if required
         if center:
             pad_amount = n_fft // 2
-            input_array = np.pad(
-                input_array, ((0, 0), (pad_amount, pad_amount)), mode=mode
-            )
+            input_array = np.pad(input_array, ((0, 0), (pad_amount, pad_amount)), mode=mode)
 
         batch, length = input_array.shape
 
         # Additional input checks
         if n_fft <= 0 or n_fft > length:
-            raise ValueError(
-                f"stft: expected 0 < n_fft <= {length}, but got n_fft={n_fft}"
-            )
+            raise ValueError(f"stft: expected 0 < n_fft <= {length}, but got n_fft={n_fft}")
 
         if hop_length <= 0:
-            raise ValueError(
-                f"stft: expected hop_length > 0, but got hop_length={hop_length}"
-            )
+            raise ValueError(f"stft: expected hop_length > 0, but got hop_length={hop_length}")
 
         if win_length <= 0 or win_length > n_fft:
             raise ValueError(
@@ -202,9 +192,7 @@ class FeatureExtractor:
 
         if complex_fft:
             if onesided:
-                raise ValueError(
-                    "Cannot have onesided output if window or input is complex"
-                )
+                raise ValueError("Cannot have onesided output if window or input is complex")
             output = np.fft.fft(input_array, n=n_fft, axis=-1, norm=norm)
         else:
             output = _rfft(input_array, n=n_fft, axis=-1, norm=norm)
@@ -327,9 +315,7 @@ class GpuMelExtractor:
         log_spec = torch.log10(torch.matmul(self.mel_filters, mags).clamp_(min=1e-10))
         # Per-chunk max: trailing zero-frames sit at the log floor (-10), so
         # they never influence the real maximum — same value as the CPU path.
-        log_spec = torch.maximum(
-            log_spec, log_spec.amax(dim=(1, 2), keepdim=True) - 8.0
-        )
+        log_spec = torch.maximum(log_spec, log_spec.amax(dim=(1, 2), keepdim=True) - 8.0)
         log_spec = (log_spec + 4.0) * 0.25
 
         feats = log_spec.cpu().numpy()

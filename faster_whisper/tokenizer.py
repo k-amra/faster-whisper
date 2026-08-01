@@ -1,7 +1,5 @@
 import string
-
 from functools import cached_property
-from typing import List, Optional, Tuple
 
 import tokenizers
 
@@ -13,26 +11,25 @@ class Tokenizer:
         self,
         tokenizer: tokenizers.Tokenizer,
         multilingual: bool,
-        task: Optional[str] = None,
-        language: Optional[str] = None,
+        task: str | None = None,
+        language: str | None = None,
     ):
         self.tokenizer = tokenizer
 
         if multilingual:
             if task not in _TASKS:
                 raise ValueError(
-                    "'%s' is not a valid task (accepted tasks: %s)"
-                    % (task, ", ".join(_TASKS))
+                    f"'{task}' is not a valid task (accepted tasks: {', '.join(_TASKS)})"
                 )
 
             if language not in _LANGUAGE_CODES:
                 raise ValueError(
-                    "'%s' is not a valid language code (accepted language codes: %s)"
-                    % (language, ", ".join(_LANGUAGE_CODES))
+                    f"'{language}' is not a valid language code (accepted "
+                    f"language codes: {', '.join(_LANGUAGE_CODES)})"
                 )
 
-            self.task = self.tokenizer.token_to_id("<|%s|>" % task)
-            self.language = self.tokenizer.token_to_id("<|%s|>" % language)
+            self.task = self.tokenizer.token_to_id(f"<|{task}|>")
+            self.language = self.tokenizer.token_to_id(f"<|{language}|>")
             self.language_code = language
         else:
             self.task = None
@@ -78,7 +75,7 @@ class Tokenizer:
         return self.no_timestamps + 1
 
     @property
-    def sot_sequence(self) -> List[int]:
+    def sot_sequence(self) -> list[int]:
         sequence = [self.sot]
 
         if self.language is not None:
@@ -89,14 +86,14 @@ class Tokenizer:
 
         return sequence
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False).ids
 
-    def decode(self, tokens: List[int]) -> str:
+    def decode(self, tokens: list[int]) -> str:
         text_tokens = [token for token in tokens if token < self.eot]
         return self.tokenizer.decode(text_tokens)
 
-    def decode_with_timestamps(self, tokens: List[int]) -> str:
+    def decode_with_timestamps(self, tokens: list[int]) -> str:
         outputs = [[]]
 
         for token in tokens:
@@ -107,12 +104,10 @@ class Tokenizer:
             else:
                 outputs[-1].append(token)
 
-        return "".join(
-            [s if isinstance(s, str) else self.tokenizer.decode(s) for s in outputs]
-        )
+        return "".join([s if isinstance(s, str) else self.tokenizer.decode(s) for s in outputs])
 
     @cached_property
-    def non_speech_tokens(self) -> Tuple[int]:
+    def non_speech_tokens(self) -> tuple[int]:
         """
         Returns the list of tokens to suppress in order to avoid any speaker tags or non-speech
         annotations, to prevent sampling texts that are not actually spoken in the audio, e.g.
@@ -124,9 +119,7 @@ class Tokenizer:
         keeping basic punctuations like commas, periods, question marks, exclamation points, etc.
         """
         symbols = list('"#()*+/:;<=>@[\\]^_`{|}~「」『』')
-        symbols += (
-            "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
-        )
+        symbols += "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
 
         # symbols that may be a single token or multiple tokens depending on the tokenizer.
         # In case they're multiple tokens, suppress the first token, which is safe because:
@@ -147,9 +140,7 @@ class Tokenizer:
 
         return tuple(sorted(result))
 
-    def split_to_word_tokens(
-        self, tokens: List[int]
-    ) -> Tuple[List[str], List[List[int]]]:
+    def split_to_word_tokens(self, tokens: list[int]) -> tuple[list[str], list[list[int]]]:
         if self.language_code in {"zh", "ja", "th", "lo", "my", "yue"}:
             # These languages don't typically use spaces, so it is difficult to split words
             # without morpheme analysis. Here, we instead split words at any
@@ -158,9 +149,7 @@ class Tokenizer:
 
         return self.split_tokens_on_spaces(tokens)
 
-    def split_tokens_on_unicode(
-        self, tokens: List[int]
-    ) -> Tuple[List[str], List[List[int]]]:
+    def split_tokens_on_unicode(self, tokens: list[int]) -> tuple[list[str], list[list[int]]]:
         decoded_full = self.decode_with_timestamps(tokens)
         replacement_char = "\ufffd"
 
@@ -190,14 +179,12 @@ class Tokenizer:
 
         return words, word_tokens
 
-    def split_tokens_on_spaces(
-        self, tokens: List[int]
-    ) -> Tuple[List[str], List[List[int]]]:
+    def split_tokens_on_spaces(self, tokens: list[int]) -> tuple[list[str], list[list[int]]]:
         subwords, subword_tokens_list = self.split_tokens_on_unicode(tokens)
         words = []
         word_tokens = []
 
-        for subword, subword_tokens in zip(subwords, subword_tokens_list):
+        for subword, subword_tokens in zip(subwords, subword_tokens_list, strict=False):
             special = subword_tokens[0] >= self.eot
             with_space = subword.startswith(" ")
             punctuation = subword.strip() in string.punctuation

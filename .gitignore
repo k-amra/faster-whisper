@@ -6,6 +6,10 @@ __pycache__/
 
 # Distribution / Packaging
 venv/
+.venv/
+build/
+dist/
+*.egg-info/
 
 # Unit Test
 .pytest_cache/
@@ -13,3 +17,8 @@ venv/
 # Ignore IDE, Editor Files
 .idea/
 .vscode/
+
+# Local media / benchmark data
+you.mp4
+*.opus
+benchmark/results/

@@ -4,12 +4,12 @@ Contributions are welcome! Here are some pointers to help you install the librar
 
 ## Install the library for development
 
-We recommend installing the module in editable mode with the `dev` extra requirements:
+We recommend using [uv](https://docs.astral.sh/uv/) with the `dev` extra to install the module in editable mode with pinned, reproducible dependencies (`uv.lock`):
 
 ```bash
 git clone https://github.com/SYSTRAN/faster-whisper.git
 cd faster-whisper/
-pip install -e .[dev]
+uv sync --extra dev
 ```
 
 ## Validate the changes before creating a pull request
@@ -17,15 +17,14 @@ pip install -e .[dev]
 1. Make sure the existing tests are still passing (and consider adding new tests as well!):
 
 ```bash
-pytest tests/
+uv run pytest tests/
 ```
 
-2. Reformat and validate the code with the following tools:
+2. Lint and format the code with [ruff](https://docs.astral.sh/ruff/):
 
 ```bash
-black .
-isort .
-flake8 .
+uv run ruff check .
+uv run ruff format .
 ```
 
 These steps are also run automatically in the CI when you open the pull request.

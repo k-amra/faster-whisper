@@ -7,17 +7,15 @@ However, the API is quite low-level so we need to manipulate audio frames direct
 """
 
 import gc
-import io
 import itertools
-
-from typing import BinaryIO, Union
+from typing import BinaryIO
 
 import av
 import numpy as np
 
 
 def decode_audio(
-    input_file: Union[str, BinaryIO],
+    input_file: str | BinaryIO,
     sampling_rate: int = 16000,
     split_stereo: bool = False,
 ):
@@ -34,6 +32,41 @@ def decode_audio(
       If `split_stereo` is enabled, the function returns a 2-tuple with the
       separated left and right channels.
     """
+    chunks = list(
+        decode_audio_chunks(input_file, sampling_rate=sampling_rate, split_stereo=split_stereo)
+    )
+    if not chunks:
+        return np.array([], dtype=np.float32)
+
+    audio = np.concatenate(chunks)
+
+    if split_stereo:
+        # fltp stereo is planar: all left samples first, then all right.
+        half = len(audio) // 2
+        return audio[:half], audio[half:]
+
+    return audio
+
+
+def decode_audio_chunks(
+    input_file: str | BinaryIO,
+    sampling_rate: int = 16000,
+    split_stereo: bool = False,
+    chunk_samples: int = 500000,
+):
+    """Decodes the audio in chunks, yielding one float32 Numpy array per chunk.
+
+    Yields chunks of roughly ``chunk_samples`` samples (16 kHz mono, ~31 s each).
+    This lets a consumer (e.g. a streaming VAD) process audio while it is still
+    being decoded.  The concatenation of all yielded arrays is byte-identical to
+    the array returned by :func:`decode_audio`.
+
+    Args:
+      input_file: Path to the input file or a file-like object.
+      sampling_rate: Resample the audio to this sample rate.
+      split_stereo: Return separate left and right channels (planar layout).
+      chunk_samples: Approximate number of samples per yielded chunk.
+    """
     resampler = av.audio.resampler.AudioResampler(
         # fltp: decode straight to float32 planar, skipping the s16
         # intermediate and the extra astype/scale pass over the whole buffer.
@@ -42,44 +75,25 @@ def decode_audio(
         rate=sampling_rate,
     )
 
-    raw_buffer = io.BytesIO()
-    dtype = None
+    try:
+        with av.open(input_file, mode="r", metadata_errors="ignore") as container:
+            frames = container.decode(audio=0)
+            frames = _ignore_invalid_frames(frames)
+            frames = _group_frames(frames, chunk_samples)
+            frames = _resample_frames(frames, resampler)
 
-    with av.open(input_file, mode="r", metadata_errors="ignore") as container:
-        frames = container.decode(audio=0)
-        frames = _ignore_invalid_frames(frames)
-        frames = _group_frames(frames, 500000)
-        frames = _resample_frames(frames, resampler)
-
-        for frame in frames:
-            array = frame.to_ndarray()
-            dtype = array.dtype
-            raw_buffer.write(array)
-
-    # It appears that some objects related to the resampler are not freed
-    # unless the garbage collector is manually run.
-    # https://github.com/SYSTRAN/faster-whisper/issues/390
-    # note that this slows down loading the audio a little bit
-    # if that is a concern, please use ffmpeg directly as in here:
-    # https://github.com/openai/whisper/blob/25639fc/whisper/audio.py#L25-L62
-    del resampler
-    # Collect only the youngest generation: it still breaks the short-lived
-    # reference cycles left by the PyAV resampler (issue #390) but avoids the
-    # full-heap pause that gc.collect() imposes on every decode.
-    gc.collect(0)
-
-    audio = np.frombuffer(raw_buffer.getbuffer(), dtype=dtype)
-
-    if dtype != np.float32:
-        # Fallback for any future resampler format change.
-        audio = audio.astype(np.float32) / 32768.0
-
-    if split_stereo:
-        # fltp stereo is planar: all left samples first, then all right.
-        half = len(audio) // 2
-        return audio[:half], audio[half:]
-
-    return audio
+            for frame in frames:
+                array = frame.to_ndarray()
+                if array.dtype != np.float32:
+                    # Fallback for any future resampler format change.
+                    array = array.astype(np.float32) / 32768.0
+                yield array.reshape(-1)
+    finally:
+        # It appears that some objects related to the resampler are not freed
+        # unless the garbage collector is manually run.
+        # https://github.com/SYSTRAN/faster-whisper/issues/390
+        del resampler
+        gc.collect(0)
 
 
 def _ignore_invalid_frames(frames):

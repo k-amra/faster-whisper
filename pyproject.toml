@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faster-whisper"
+dynamic = ["version"]
+description = "Faster Whisper transcription with CTranslate2"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Guillaume Klein" }]
+keywords = [
+    "openai",
+    "whisper",
+    "speech",
+    "ctranslate2",
+    "inference",
+    "quantization",
+    "transformer",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "av>=11.0,<13",
+    "ctranslate2>=4.0,<5",
+    "huggingface_hub>=0.13",
+    "tokenizers>=0.13,<1",
+    "onnxruntime>=1.14,<2",
+    "tqdm",
+    "numpy",
+    "scipy",
+    "torch>=2.1.1",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+]
+
+[project.optional-dependencies]
+fork = [
+    "transformers",
+    "pyannote-audio>=3.1.1",
+    "pandas",
+    "torchaudio>=2.1.2",
+    "jsons>=1.6.3",
+]
+conversion = [
+    "transformers[torch]>=4.23",
+]
+dev = [
+    "ruff",
+    "pytest",
+    "mypy",
+]
+benchmark = [
+    "transformers",
+    "jiwer",
+    "evaluate",
+    "datasets",
+    "memory_profiler",
+    "py3nvml",
+]
+app = [
+    "yt-dlp",
+]
+
+[project.urls]
+Homepage = "https://github.com/SYSTRAN/faster-whisper"
+
+[tool.setuptools]
+packages = ["faster_whisper", "faster_whisper.assets"]
+
+[tool.setuptools.package-data]
+faster_whisper = ["assets/*.onnx"]
+
+[tool.setuptools.dynamic]
+version = { attr = "faster_whisper.version.__version__" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E203", "B006"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["faster_whisper"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

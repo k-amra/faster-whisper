@@ -173,6 +173,7 @@ To directly use the model for improved language detection, the following code sn
 
 ```python
 from faster_whisper import WhisperModel
+
 model = WhisperModel("medium", device="cuda", compute_type="float16")
 language_info = model.detect_language_multi_segment("audio.mp3")
 ```
@@ -207,7 +208,9 @@ from faster_whisper import WhisperModel
 model_size = "distil-large-v3"
 
 model = WhisperModel(model_size, device="cuda", compute_type="float16")
-segments, info = model.transcribe("audio.mp3", beam_size=5, language="en", condition_on_previous_text=False)
+segments, info = model.transcribe(
+    "audio.mp3", beam_size=5, language="en", condition_on_previous_text=False
+)
 
 for segment in segments:
     print("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
