@@ -37,11 +37,11 @@ dependencies = [
     "ctranslate2>=4.0,<5",
     "huggingface_hub>=0.13",
     "tokenizers>=0.13,<1",
-    "onnxruntime>=1.14,<2",
+    "onnxruntime-gpu>=1.14,<2",
     "tqdm",
     "numpy",
     "scipy",
-    "torch>=2.1.1",
+    "torch==2.7.0",
     "nvidia-cublas-cu12",
     "nvidia-cudnn-cu12",
 ]
@@ -87,16 +87,17 @@ faster_whisper = ["assets/*.onnx"]
 version = { attr = "faster_whisper.version.__version__" }
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu128" }
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+extend-exclude = ["benchmark/", "docker/", "transcribe_vod_fasterwhisper.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

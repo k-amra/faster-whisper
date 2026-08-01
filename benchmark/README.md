@@ -9,27 +9,23 @@ the same decode options) so you can measure whether a change inside
 
 ```sh
 uv venv --python 3.12
-uv pip install --python .venv -r requirements.txt yt-dlp nvidia-cudnn-cu12 nvidia-cublas-cu12 scipy
+uv sync --extra dev --extra benchmark
 ```
 
 > faster-whisper is installed **editable** into the venv via `uv sync` (see
 > `pyproject.toml`), so `import faster_whisper` resolves to the local source
 > tree. This means switching code revisions is as simple as `git checkout`.
+> The lockfile pins `torch==2.7.0+cu128` (pytorch `cu128` index) and
+> `onnxruntime-gpu` so both GPU mel extraction and the VAD run on CUDA.
 
 ### VAD model asset
 
 `faster_whisper/vad.py` loads the Silero VAD ONNX model from
-`faster_whisper/assets/silero_vad_v6.onnx`. That file is **not tracked in git**
-(yet) — place it in the repo once:
-
-```sh
-curl -L -o faster_whisper/assets/silero_vad_v6.onnx \
-  https://huggingface.co/bitsydarel/silero-vad-onnx/resolve/main/silero_vad_v6.2.1.onnx
-```
-
-`faster_whisper/vad.py` was also patched to use the v6 model's `state`/`sr`
-ONNX interface (the v6.2.1 export has `input`/`state`/`sr` inputs and a single
-probability output), so the VAD filter works at all.
+`faster_whisper/assets/silero_vad_v6.onnx`. That file is committed in the repo
+(under `faster_whisper/assets/`), so no download is needed. `faster_whisper/vad.py`
+was patched to use the v6 model's `state`/`sr` ONNX interface (the v6.2.1 export
+has `input`/`state`/`sr` inputs and a single probability output), so the VAD
+filter works at all.
 
 All commands below should be run from the repo root with the venv python, e.g.
 `.venv\Scripts\python.exe benchmark\pipeline_benchmark.py ...`.
