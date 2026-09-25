@@ -333,7 +333,7 @@ class BatchedInferencePipeline:
         multilingual: bool = False,
         vad_filter: bool = True,
         vad_parameters: dict | VadOptions | None = None,
-        max_new_tokens: int | None = None,
+        max_new_tokens: int | None = 128,
         chunk_length: int | None = None,
         clip_timestamps: list[dict] | None = None,
         hallucination_silence_threshold: float | None = None,
@@ -379,8 +379,10 @@ class BatchedInferencePipeline:
                 https://github.com/snakers4/silero-vad.
             vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
                 parameters and default values in the class `VadOptions`).
-            max_new_tokens: Maximum number of new tokens to generate per-chunk. If not set,
-                the maximum will be set by the default max_length.
+            max_new_tokens: Maximum number of new tokens to generate per-chunk
+                (default 128 — a 10 s chunk needs ~30-40; bounds pathological
+                repetition loops). If not set, the maximum will be set by the
+                default max_length.
             chunk_length: The length of audio segments. If it is not None, it will overwrite the
                 default chunk_length of the FeatureExtractor.
             clip_timestamps: Optionally provide list of dictionaries each containing "start" and

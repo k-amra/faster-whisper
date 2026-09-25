@@ -300,7 +300,7 @@ class GpuMelExtractor:
             # Frames kept by _extract_and_cache for a chunk of this length.
             keep.append(min((len(c) + pad) // hop - 1, max_frames))
 
-        t = torch.from_numpy(buf).to(self.device)
+        t = torch.from_numpy(buf).pin_memory().to(self.device, non_blocking=True)
         stft = torch.stft(
             t,
             n_fft,

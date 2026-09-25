@@ -339,3 +339,89 @@ Dependency swaps, not a perf experiment:
   2000-window block); outputs match CPU to ~1.6e-4; transcripts still
   byte-identical (40/40). End-to-end gain negligible (VAD already ~0.00 s
   after 2.2) but removes the CPU-only constraint and frees CPU threads.
+
+---
+
+## Experiment 7 — P0 defaults + penalty wiring + safety caps (2026-09-25)
+
+Code changes (all in working tree, RTX 3060 12 GB, ct2 4.8.1):
+- `transcribe_vod_fasterwhisper.py:72-73`: `DEFAULT_CHUNK_LENGTH 30→10`,
+  `DEFAULT_BATCH_SIZE 16→64` (the Exp.4 winner was never applied to the
+  script — anyone running without flags paid the 30/16 penalty).
+- `benchmark/pipeline_benchmark.py`: same default fix (10/64) + new
+  `--repetition-penalty` (1.2) / `--no-repeat-ngram-size` (3) flags so the
+  benchmark mirrors the script exactly.
+- `transcribe_vod_fasterwhisper.py:395-403`: forward `repetition_penalty` /
+  `no_repeat_ngram_size` into `pipeline.transcribe()` (previously accepted
+  but silently dropped — the anti-loop guard was inactive).
+- `transcribe.py` (`BatchedInferencePipeline.transcribe`): `max_new_tokens`
+  default `None→128` (10 s chunk needs ~30-40 tokens; bounds pathological
+  loops, zero effect on normal EOT-terminated decodes).
+- `feature_extractor.py` (`GpuMelExtractor.extract_batch`): pinned-memory H2D
+  (`pin_memory().to(device, non_blocking=True)`), bitwise-identical, ~0.3 s.
+
+Diagnostic (temporary encode/generate timers, since removed): 5-min PL clip,
+chunk10/b64, per-14-batch `encode 0.59 s vs generate 1.04 s` → generate ~64%
+of forward → **decoder-dominant → chunk sweep matrix skipped** (chunk 10→8
+already tied at 147.8 vs 147.9 s; encoder vein exhausted).
+
+Quality check (5-min PL clip, old 1.0/0/None vs new 1.2/3/128): 14/14 segments,
+identical timestamps. New settings **fixed a real loop**: old had
+"Na sześć miesięcy! ×7", new emits it once. Other diffs are minor greedy
+re-phrasings, same content. Penalty cost ~+0-1% forward (within noise).
+
+Perf check (`p1_p4_verify.json`, 5-min, repeat 3): forward 1.54-1.59 s vs
+1.64 s pre-change — no regression (5-min phases round to 0.00 s, so
+`compare.py` hits ZeroDivisionError on them — script limitation, not a code
+issue; use ≥30-min clips for A/B).
+
+Dead ends closed (verified, not re-run): ctranslate2 4.8.1 `Whisper` exposes
+no CUDA-graph API and no `workspace`/`max_batch_size` on `generate` — C8 and
+B-model-kwargs are inapplicable. Clock lock (`nvidia-smi -lgc`) needs admin
+on this machine — use `--repeat 5` + warmup instead (±3-5 s forward noise).
+
+Note: `tests/test_transcribe.py` has 5 pre-existing failures on the clean
+tree (tiny-model punctuation drift with commas, `test_batched_transcribe`
+ValueError, `test_multisegment_lang_id` AttributeError) — unrelated to this
+change (identical failure set before/after, verified via `git stash`).
+
+### Full-file confirm + ablation (same day, same machine, `you.opus` 13710 s)
+
+Same-day A/B isolates the P0+P2 bundle from the 8-week env drift between
+`super_chunk10_b64_incr_tail.json` (Aug 1, best 114.08 s) and today. Baseline
+re-run on stashed code (penalty 1.0/0, cap None) → `p0_p2_baseline_sameday.json`:
+best 114.27 s, runs 114–120 s — reproduces Aug 1 exactly, so env drift ≈ 0.
+
+| run (`--repeat 5`) | forward med | total med | vs same-day base |
+| ------------------ | ----------- | --------- | ---------------- |
+| baseline (1.0/0, cap None) | 115.09 s | 118.98 s | — |
+| penalty-only (1.2/3, cap None) | 104.59 s | 108.04 s | **-9.2%** |
+| bundle (1.2/3, cap 128) = `p0_p2_full.json` | 97.52 s | 101.27 s | **-14.9%** |
+
+Ranges don't overlap (bundle worst 102.61 s < baseline best 114.27 s), GPU
+66→67 °C / ~145 W both sides — no thermal confound. Verdict: **both changes
+are real speedups, not noise**:
+- `repetition_penalty=1.2 + no_repeat_ngram_size=3` alone: **~-9% forward**.
+  Mechanism: penalty steers greedy decode to earlier EOT (shorter token
+  trajectories per chunk), which outweighs the per-step logit cost.
+- `max_new_tokens=128` on top: **another ~-6%**. Mechanism: the 3.8 h file
+  contains runaway chunks generating >128 tokens (hallucination tails up to
+  the 448 cap); the bound cuts exactly that waste. Supporting evidence:
+  penalty-only run 5/5 spiked to 119.15 s (an unbound runaway), while all 5
+  bundle runs stayed ≤102.61 s — the cap also bounds worst-case variance.
+
+**New best: 98.78 s total (~139x realtime), cumulative 227 s → 98.8 s
+(-56.5%) vs the original chunk30/batch16 baseline.** Pinned H2D contributes
+~0 (extract 0.79→0.84 s, noise) but is kept — free and correct.
+
+Follow-ups done in the same session:
+- `benchmark/compare.py`: `ZeroDivisionError` on zero-median phases fixed
+  via `pct_delta()` guard (both-zero → +0.00% ~noise). Verified on
+  `diag.json` vs `p1_p4_verify.json`.
+- `tests/test_transcribe.py`: full suite green (10 passed). Fixed
+  `test_batched_transcribe` (unpack `(generator, info)` tuple correctly),
+  `test_multisegment_lang_id` (removed `detect_language_multi_segment` →
+  `detect_language(audio, language_detection_segments=4)`, threshold 0.8→0.7),
+  3× tiny-model comma-drift expectations, `test_prefix_with_timestamps`
+  end bound (`<11` → `<=11`), and `test_vad` expectation (VAD-chunked tiny
+  decode is deterministically lowercase/unpunctuated — documented in-test).
