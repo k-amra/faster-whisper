@@ -172,10 +172,13 @@ segments = list(segments)  # The transcription will actually run here.
 To directly use the model for improved language detection, the following code snippet can be used:
 
 ```python
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, decode_audio
 
 model = WhisperModel("medium", device="cuda", compute_type="float16")
-language_info = model.detect_language_multi_segment("audio.mp3")
+audio = decode_audio("audio.mp3")
+language, probability, all_probs = model.detect_language(
+    audio, language_detection_segments=4
+)
 ```
 
 ### Batched faster-whisper
@@ -186,13 +189,13 @@ The batched version of faster-whisper is inspired by [whisper-x](https://github.
 The following code snippet illustrates how to run inference with batched version on an example audio file. Please also refer to the test scripts of batched faster whisper.
 
 ```python
-from faster_whisper import BatchedInferencePipeline
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 
 model = WhisperModel("medium", device="cuda", compute_type="float16")
 batched_model = BatchedInferencePipeline(model=model)
-result = batched_model.transcribe("audio.mp3", batch_size=16)
+segments, info = batched_model.transcribe("audio.mp3", batch_size=16)
 
-for segment, info in result:
+for segment in segments:
     print("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
 ```
 
