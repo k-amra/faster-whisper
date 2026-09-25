@@ -59,6 +59,11 @@ class Segment:
     no_speech_prob: float
     words: list[Word] | None
     temperature: float | None
+    # True when generation stopped because it hit the token budget
+    # (max_new_tokens / model max_length) instead of emitting EOT.
+    # CTranslate2 strips EOT, so hitting the budget exactly means the text
+    # is likely cut mid-word. Defaults to False for backwards compatibility.
+    truncated: bool = False
 
     def _asdict(self):
         warn(
@@ -199,6 +204,7 @@ class BatchedInferencePipeline:
                         end=subsegment["end"],
                         compression_ratio=get_compression_ratio(decoded),
                         seek=int(chunk_metadata["offset"] * self.model.frames_per_second),
+                        truncated=output.get("truncated", False),
                     )
                     for subsegment in subsegments
                 ]
@@ -236,19 +242,15 @@ class BatchedInferencePipeline:
         )
 
         if options.max_new_tokens is not None:
-            max_length = len(prompt) + options.max_new_tokens
+            max_length = min(len(prompt) + options.max_new_tokens, self.model.max_length)
         else:
             max_length = self.model.max_length
 
-        if max_length > self.model.max_length:
+        if max_length <= len(prompt):
             raise ValueError(
-                f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
-                f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
-                f"and `max_new_tokens` is: {max_length}. This exceeds the "
-                f"`max_length` of the Whisper model: {self.model.max_length}. "
-                "You should either reduce the length of your prompt, or "
-                "reduce the value of `max_new_tokens`, "
-                f"so that their combined length is less that {self.model.max_length}."
+                f"Prompt ({len(prompt)} tokens) leaves no room for generation "
+                f"(max_length={max_length}). Shorten prefix/hotwords/initial_prompt "
+                "or raise max_new_tokens."
             )
 
         encoder_output = self.model.encode(features)
@@ -281,16 +283,28 @@ class BatchedInferencePipeline:
         )
 
         output = []
+        budget = max_length - len(prompt)
         for result in results:
+            tokens = result.sequences_ids[0]
+            # CTranslate2 strips EOT; hitting the budget exactly means we were
+            # cut off by max_length rather than stopping naturally.
+            truncated = len(tokens) >= budget
+            if truncated:
+                self.model.logger.warning(
+                    "Chunk hit generation budget (%d tokens) - text is likely "
+                    "truncated. Raise/remove max_new_tokens.",
+                    budget,
+                )
             # return scores
-            seq_len = len(result.sequences_ids[0])
+            seq_len = len(tokens)
             cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
 
             output.append(
                 dict(
                     avg_logprob=cum_logprob / (seq_len + 1),
                     no_speech_prob=result.no_speech_prob,
-                    tokens=result.sequences_ids[0],
+                    tokens=tokens,
+                    truncated=truncated,
                 )
             )
 
@@ -333,7 +347,7 @@ class BatchedInferencePipeline:
         multilingual: bool = False,
         vad_filter: bool = True,
         vad_parameters: dict | VadOptions | None = None,
-        max_new_tokens: int | None = 128,
+        max_new_tokens: int | None = None,
         chunk_length: int | None = None,
         clip_timestamps: list[dict] | None = None,
         hallucination_silence_threshold: float | None = None,
@@ -379,10 +393,14 @@ class BatchedInferencePipeline:
                 https://github.com/snakers4/silero-vad.
             vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
                 parameters and default values in the class `VadOptions`).
-            max_new_tokens: Maximum number of new tokens to generate per-chunk
-                (default 128 — a 10 s chunk needs ~30-40; bounds pathological
-                repetition loops). If not set, the maximum will be set by the
-                default max_length.
+            max_new_tokens: Maximum number of new tokens to generate per-chunk.
+                If None (default), the model's full context budget is used
+                (max_length 448 for all Whisper sizes). Setting this too low
+                (e.g. 128) silently truncates dense speech in token-inefficient
+                languages (Polish, Czech, Hungarian, Turkish, ...) which can
+                routinely need 150-250 tokens per 30 s window. A low cap only
+                bounds worst-case decode length / repetition loops at the cost
+                of cut words; pass it explicitly if you want that trade-off.
             chunk_length: The length of audio segments. If it is not None, it will overwrite the
                 default chunk_length of the FeatureExtractor.
             clip_timestamps: Optionally provide list of dictionaries each containing "start" and
@@ -798,6 +816,7 @@ class BatchedInferencePipeline:
                             no_speech_prob=segment["no_speech_prob"],
                             compression_ratio=segment["compression_ratio"],
                             temperature=options.temperatures[0],
+                            truncated=segment.get("truncated", False),
                         )
                     pbar.update(1)
         else:
@@ -868,6 +887,7 @@ class BatchedInferencePipeline:
                                 no_speech_prob=segment["no_speech_prob"],
                                 compression_ratio=segment["compression_ratio"],
                                 temperature=options.temperatures[0],
+                                truncated=segment.get("truncated", False),
                             )
                         pbar.update(1)
             else:
@@ -917,6 +937,7 @@ class BatchedInferencePipeline:
                                     no_speech_prob=segment["no_speech_prob"],
                                     compression_ratio=segment["compression_ratio"],
                                     temperature=options.temperatures[0],
+                                    truncated=segment.get("truncated", False),
                                 )
                             pbar.update(1)
                 finally:
@@ -995,6 +1016,7 @@ class BatchedInferencePipeline:
                 no_speech_prob=segment["no_speech_prob"],
                 compression_ratio=segment["compression_ratio"],
                 temperature=options.temperatures[0],
+                truncated=segment.get("truncated", False),
             )
 
         # Super-chunk accumulator (mirrors collect_chunks() exactly).
@@ -1929,19 +1951,15 @@ class WhisperModel:
             round(options.max_initial_timestamp / self.time_precision)
         )
         if options.max_new_tokens is not None:
-            max_length = len(prompt) + options.max_new_tokens
+            max_length = min(len(prompt) + options.max_new_tokens, self.max_length)
         else:
             max_length = self.max_length
 
-        if max_length > self.max_length:
+        if max_length <= len(prompt):
             raise ValueError(
-                f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
-                f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
-                f"and `max_new_tokens` is: {max_length}. This exceeds the "
-                f"`max_length` of the Whisper model: {self.max_length}. "
-                "You should either reduce the length of your prompt, or "
-                "reduce the value of `max_new_tokens`, "
-                f"so that their combined length is less that {self.max_length}."
+                f"Prompt ({len(prompt)} tokens) leaves no room for generation "
+                f"(max_length={max_length}). Shorten prefix/hotwords/initial_prompt "
+                "or raise max_new_tokens."
             )
 
         for temperature in options.temperatures:

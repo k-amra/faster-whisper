@@ -27,6 +27,8 @@ import re
 import subprocess
 import sys
 import time
+import zlib
+from collections.abc import Iterable, Iterator
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -78,6 +80,15 @@ DEFAULT_LANGUAGE = "pl"
 # stops loops like "Dziękuję bardzo, dziękuję bardzo, ...".
 DEFAULT_REPETITION_PENALTY = 1.2
 DEFAULT_NO_REPEAT_NGRAM_SIZE = 3
+# No cap by default: use the model's full context budget (448 tokens for all
+# Whisper sizes). A low cap (e.g. 128) silently truncates dense speech in
+# token-inefficient languages (PL/CS/HU/TR routinely need 150-250 tokens per
+# 30 s window) — the generator stops mid-word with no EOT marker.
+DEFAULT_MAX_NEW_TOKENS: Optional[int] = None
+# Post-filter for degenerate repetition loops (e.g. "Yyyyyyy..."): the batched
+# path has no temperature fallback, so segments whose gzip ratio exceeds this
+# are dropped. Mirrors the sequential path's compression_ratio_threshold.
+DEFAULT_COMPRESSION_RATIO_THRESHOLD: Optional[float] = 2.4
 FFMPEG_LOG_LEVEL = "error"  # Use "info" or "debug" for more detailed ffmpeg logs
 FFMPEG_TIMEOUT_SECONDS = 3600  # Safety net so a hung ffmpeg can't block the pipeline
 YTDLP_RETRIES = 3
@@ -108,6 +119,26 @@ def _format_duration(seconds: float) -> str:
         parts.append(f"{minutes}m")
     parts.append(f"{secs}s")
     return " ".join(parts)
+
+
+def _parse_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.lower() in ("none", "null", "auto", ""):
+        return None
+    return int(value)
+
+
+def _parse_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value
+    if isinstance(value, str) and value.lower() in ("none", "null", "auto", ""):
+        return None
+    return float(value)
 
 
 def _redact_url(url: str) -> str:
@@ -296,6 +327,66 @@ def convert_to_opus(input_file: str, output_file: str) -> bool:
     return False
 
 
+def compression_ratio(text: str) -> float:
+    """Gzip compression ratio of *text* (standard Whisper repetition signal)."""
+    b = text.encode("utf-8")
+    return len(b) / max(1, len(zlib.compress(b)))
+
+
+def drop_hallucinations(
+    segments: Iterable[Any], max_ratio: Optional[float] = 2.4
+) -> Iterator[Any]:
+    """Drop degenerate repetition loops (e.g. "Yyyyyyy...").
+
+    The batched pipeline has no temperature fallback, so once the token cap is
+    removed a looping hallucination can run to the full model budget. The gzip
+    ratio is the standard Whisper signal for this; the sequential path applies
+    the same threshold via ``compression_ratio_threshold``.
+    """
+    if max_ratio is None:
+        yield from segments
+        return
+    for s in segments:
+        ratio = getattr(s, "compression_ratio", None)
+        if ratio is None:
+            ratio = compression_ratio(s.text)
+        if ratio > max_ratio:
+            logger.warning(
+                "[%.2fs -> %.2fs] dropping repetitive segment (ratio %.2f): ...%s",
+                s.start,
+                s.end,
+                ratio,
+                s.text.strip()[-60:],
+            )
+            continue
+        yield s
+
+
+def annotate_suspect_cuts(segments: Iterable[Any]) -> Iterator[Any]:
+    """Log segments that look cut off instead of ending naturally.
+
+    Flags two cases: (1) the chunk hit the generation budget (``truncated``
+    set by the library — a token-cap cut lands mid-word regardless of audio),
+    and (2) heuristically, text ending in a letter with a time gap before the
+    next segment (a VAD hard-split or an unflagged cap hit).
+    """
+    segs = list(segments)
+    for i, s in enumerate(segs):
+        text = s.text.strip()
+        cap_hit = bool(getattr(s, "truncated", False))
+        gap_after = i + 1 < len(segs) and segs[i + 1].start - s.end > 0.5
+        dangling = bool(text) and text[-1].isalpha() and gap_after
+        if cap_hit or dangling:
+            logger.warning(
+                "[%.2fs -> %.2fs] possible cut (%s): ...%s",
+                s.start,
+                s.end,
+                "token cap" if cap_hit else "no terminal punct",
+                text[-40:],
+            )
+        yield s
+
+
 def transcribe_audio(
     input_file: str,
     output_file: str,
@@ -311,6 +402,8 @@ def transcribe_audio(
     force: bool = False,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM_SIZE,
+    max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
+    compression_ratio_threshold: Optional[float] = DEFAULT_COMPRESSION_RATIO_THRESHOLD,
 ) -> bool:
     """
     Transcribes an audio file using the FasterWhisper model.
@@ -334,6 +427,11 @@ def transcribe_audio(
             repetition loops.
         no_repeat_ngram_size (int): Prevent repetitions of ngrams of this size
             (set 0 to disable). Reduces hallucinated repetition loops.
+        max_new_tokens (int, optional): Cap generated tokens per chunk.
+            Default None means no cap (full model budget, 448 tokens). Setting
+            this too low (e.g. 128) silently truncates fast speech mid-word.
+        compression_ratio_threshold (float, optional): Drop segments whose gzip
+            ratio exceeds this (repetition hallucinations). None disables.
 
     Returns:
         bool: True if transcription was successful, False otherwise.
@@ -391,6 +489,7 @@ def transcribe_audio(
             logger.info(f"  VAD parameters: {effective_vad_params}")
         logger.info(f"  Beam size: {beam_size}")
         logger.info(f"  Chunk length: {chunk_length}s")
+        logger.info(f"  Max new tokens: {max_new_tokens}")
         pipeline = BatchedInferencePipeline(model)
         segments, info = pipeline.transcribe(
             input_file,
@@ -402,6 +501,7 @@ def transcribe_audio(
             batch_size=batch_size,
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
+            max_new_tokens=max_new_tokens,
         )
         detected_lang = info.language
         detected_lang_prob = info.language_probability
@@ -417,10 +517,15 @@ def transcribe_audio(
         # iterating it below, not inside model.transcribe(). The atomic tmp->final rename
         # ensures a crash mid-write can't leave a partial file that the skip-if-exists
         # check above would later mistake for a complete transcript.
+        # Materialize here so suspect-cut detection (which needs a 1-segment
+        # lookahead for the gap check) and the repetition post-filter can run.
         logger.info(f"Decoding and writing transcript to {output_file}...")
         _transcribe_t0 = time.perf_counter()
+        filtered = annotate_suspect_cuts(
+            drop_hallucinations(segments, max_ratio=compression_ratio_threshold)
+        )
         with open(tmp_output_file, "w", encoding="utf-8") as f:
-            for segment in segments:
+            for segment in filtered:
                 segment_output = (
                     f"[{segment.start:.2f}s -> {segment.end:.2f}s] "
                     f"{segment.text.strip()}\n"
@@ -584,6 +689,8 @@ def main(args: argparse.Namespace) -> bool:
                 batch_size=args.batch_size,
                 use_vad=(not args.no_vad),
                 force=args.force,
+                max_new_tokens=args.max_new_tokens,
+                compression_ratio_threshold=args.compression_ratio_threshold,
             )
             logger.info(
                 f"Transcription step took {_format_duration(time.perf_counter() - _step_t0)}."
@@ -703,6 +810,21 @@ if __name__ == "__main__":
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help="Maximum number of chunks to process in parallel per inference step.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=_parse_optional_int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help="Cap generated tokens per chunk. Default: no cap (model max). "
+        "Setting this too low (e.g. 128) silently truncates fast speech. "
+        "Use 'none' for no cap.",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=_parse_optional_float,
+        default=DEFAULT_COMPRESSION_RATIO_THRESHOLD,
+        help="Drop segments with gzip compression ratio above this "
+        "(repetition hallucinations). Use 'none' to disable.",
     )
     # Parse arguments
     parsed_args = parser.parse_args()

@@ -1,6 +1,11 @@
+import inspect
+import logging
 import os
 
+import numpy as np
+
 from faster_whisper import BatchedInferencePipeline, WhisperModel, decode_audio
+from faster_whisper.transcribe import TranscriptionOptions
 
 
 def test_supported_languages():
@@ -125,3 +130,150 @@ def test_multisegment_lang_id(physcisworks_path):
     )
     assert language == "en"
     assert confidence > 0.7
+
+
+# --- Regression tests for the implicit max_new_tokens=128 cap ---------------
+# Dense speech in token-inefficient languages needs 150-250 tokens per 30 s
+# window; the old default (128) cut words mid-token with no EOT marker.
+
+
+class _FakeResult:
+    def __init__(self, sequences_ids, scores, no_speech_prob=0.0):
+        self.sequences_ids = sequences_ids
+        self.scores = scores
+        self.no_speech_prob = no_speech_prob
+
+
+class _FakeCTranslate2Model:
+    def __init__(self):
+        self.captured = {}
+
+    def generate(self, encoder_output, prompts, **kwargs):
+        self.captured.update(kwargs)
+        self.captured["prompts"] = prompts
+        return self._results
+
+    def encode(self, features):
+        return object()
+
+
+def _make_fake_pipeline(prompt_len=4, max_length=448):
+    """BatchedInferencePipeline with all model I/O stubbed out."""
+    inner = _FakeCTranslate2Model()
+    _prompt_len = prompt_len
+    _max_length = max_length
+
+    class _FakeModel:
+        logger = logging.getLogger("test")
+
+        def __init__(self):
+            self.model = inner
+            self.max_length = _max_length
+
+        def get_prompt(self, tokenizer, previous_tokens=None, **kwargs):
+            return list(range(_prompt_len))
+
+        def encode(self, features):
+            return object()
+
+    pipe = BatchedInferencePipeline.__new__(BatchedInferencePipeline)
+    pipe.model = _FakeModel()
+    pipe.last_speech_timestamp = 0.0
+    return pipe, inner
+
+
+def _make_options(max_new_tokens=None):
+    return TranscriptionOptions(
+        beam_size=1,
+        best_of=5,
+        patience=1.0,
+        length_penalty=1.0,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=0,
+        log_prob_threshold=None,
+        no_speech_threshold=None,
+        compression_ratio_threshold=None,
+        condition_on_previous_text=False,
+        prompt_reset_on_temperature=0.5,
+        temperatures=[0.0],
+        initial_prompt=None,
+        prefix=None,
+        suppress_blank=True,
+        suppress_tokens=[],
+        without_timestamps=True,
+        max_initial_timestamp=0.0,
+        word_timestamps=False,
+        prepend_punctuations="",
+        append_punctuations="",
+        multilingual=False,
+        max_new_tokens=max_new_tokens,
+        clip_timestamps="0",
+        hallucination_silence_threshold=None,
+        hotwords=None,
+    )
+
+
+class _FakeTokenizer:
+    def encode(self, text):
+        return []
+
+
+def _dummy_features(n=1):
+    return np.zeros((n, 80, 300), dtype=np.float32)
+
+
+def test_batched_default_is_unlimited():
+    sig = inspect.signature(BatchedInferencePipeline.transcribe)
+    assert sig.parameters["max_new_tokens"].default is None
+
+
+def test_batched_default_uses_full_model_budget():
+    pipe, inner = _make_fake_pipeline(prompt_len=4, max_length=448)
+    inner._results = [_FakeResult(sequences_ids=[[1, 2, 3]], scores=[0.0])]
+    opts = _make_options(max_new_tokens=None)
+    pipe.generate_segment_batched(_dummy_features(1), _FakeTokenizer(), opts)
+    assert inner.captured["max_length"] == 448
+
+
+def test_batched_explicit_max_new_tokens_is_clamped():
+    pipe, inner = _make_fake_pipeline(prompt_len=4, max_length=448)
+    inner._results = [_FakeResult(sequences_ids=[[1, 2, 3]], scores=[0.0])]
+    opts = _make_options(max_new_tokens=10_000)
+    _, outputs = pipe.generate_segment_batched(_dummy_features(1), _FakeTokenizer(), opts)
+    assert inner.captured["max_length"] == 448
+    assert outputs[0]["truncated"] is False
+
+
+def test_truncation_is_flagged():
+    pipe, inner = _make_fake_pipeline(prompt_len=4, max_length=448)
+    budget = 5
+
+    def fake_generate(encoder_output, prompts, **kwargs):
+        n = kwargs["max_length"] - len(prompts[0])
+        assert n == budget
+        return [_FakeResult(sequences_ids=[list(range(n))], scores=[0.0])]
+
+    inner.generate = fake_generate
+    opts = _make_options(max_new_tokens=budget)
+    _, outputs = pipe.generate_segment_batched(_dummy_features(1), _FakeTokenizer(), opts)
+    assert outputs[0]["truncated"] is True
+
+
+def test_no_truncation_when_under_budget():
+    pipe, inner = _make_fake_pipeline(prompt_len=4, max_length=448)
+    inner._results = [_FakeResult(sequences_ids=[[1, 2]], scores=[0.0])]
+    opts = _make_options(max_new_tokens=50)
+    _, outputs = pipe.generate_segment_batched(_dummy_features(1), _FakeTokenizer(), opts)
+    assert outputs[0]["truncated"] is False
+
+
+def test_prompt_without_room_raises():
+    pipe, inner = _make_fake_pipeline(prompt_len=448, max_length=448)
+    inner._results = [_FakeResult(sequences_ids=[[1]], scores=[0.0])]
+    opts = _make_options(max_new_tokens=0)
+    try:
+        pipe.generate_segment_batched(_dummy_features(1), _FakeTokenizer(), opts)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when prompt leaves no room")
